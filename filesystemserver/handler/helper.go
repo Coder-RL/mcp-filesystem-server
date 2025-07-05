@@ -1,12 +1,15 @@
 package handler
 
 import (
+	"context"
 	"fmt"
 	"mime"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/gabriel-vasile/mimetype"
 )
@@ -39,14 +42,70 @@ func (fs *FilesystemHandler) isPathInAllowedDirs(path string) bool {
 	return false
 }
 
+// validatePathSecurity performs security validation on raw user input before path resolution
+func (fs *FilesystemHandler) validatePathSecurity(requestedPath string) error {
+	// Block null bytes (can bypass security checks in some filesystems)
+	if strings.Contains(requestedPath, "\x00") {
+		return fmt.Errorf("invalid path: contains null byte")
+	}
+
+	// Block obvious traversal attempts
+	if strings.Contains(requestedPath, "..") {
+		return fmt.Errorf("access denied - path traversal attempt detected")
+	}
+
+	// Block absolute paths that don't start with allowed prefixes
+	if filepath.IsAbs(requestedPath) {
+		allowed := false
+		for _, allowedDir := range fs.allowedDirs {
+			cleanAllowed := strings.TrimSuffix(allowedDir, string(filepath.Separator))
+			if strings.HasPrefix(requestedPath, cleanAllowed) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("access denied - absolute path outside allowed directories")
+		}
+	}
+
+	// Block suspicious patterns
+	suspiciousPatterns := []string{
+		"/../",
+		"/./",
+		"\\..\\",
+		"\\",
+		"//",
+		"\\/",
+	}
+	
+	for _, pattern := range suspiciousPatterns {
+		if strings.Contains(requestedPath, pattern) {
+			return fmt.Errorf("access denied - suspicious path pattern detected: %s", pattern)
+		}
+	}
+
+	// Limit path length to prevent buffer overflow attacks
+	if len(requestedPath) > 4096 {
+		return fmt.Errorf("access denied - path too long (max 4096 characters)")
+	}
+
+	return nil
+}
+
 func (fs *FilesystemHandler) validatePath(requestedPath string) (string, error) {
-	// Always convert to absolute path first
+	// Security: Validate path BEFORE resolution to prevent traversal attacks
+	if err := fs.validatePathSecurity(requestedPath); err != nil {
+		return "", err
+	}
+
+	// Convert to absolute path after security validation
 	abs, err := filepath.Abs(requestedPath)
 	if err != nil {
 		return "", fmt.Errorf("invalid path: %w", err)
 	}
 
-	// Check if path is within allowed directories
+	// Double-check after resolution
 	if !fs.isPathInAllowedDirs(abs) {
 		return "", fmt.Errorf(
 			"access denied - path outside allowed directories: %s",
@@ -156,4 +215,111 @@ func isTextFile(mimeType string) bool {
 func isImageFile(mimeType string) bool {
 	return strings.HasPrefix(mimeType, "image/") ||
 		(mimeType == "application/xml" && strings.HasSuffix(strings.ToLower(mimeType), ".svg"))
+}
+
+// validateRegexSecurity validates regex patterns to prevent ReDoS attacks
+func (fs *FilesystemHandler) validateRegexSecurity(pattern string) error {
+	// Check pattern length
+	if len(pattern) > MAX_REGEX_LENGTH {
+		return fmt.Errorf("regex pattern too long (max %d characters)", MAX_REGEX_LENGTH)
+	}
+
+	// Block dangerous patterns that can cause exponential backtracking
+	dangerousPatterns := []string{
+		"(a+)+",          // Nested quantifiers
+		"(a*)*",          // Nested quantifiers
+		"(a+)*",          // Nested quantifiers
+		"(.*)*",          // Nested quantifiers
+		"(.+)+",          // Nested quantifiers
+		"(a|a)*",         // Alternation with overlap
+		"([a-z]+)+",      // Character class with nested quantifiers
+		"(\\w+)+",        // Word boundary with nested quantifiers
+	}
+
+	for _, dangerous := range dangerousPatterns {
+		if strings.Contains(pattern, dangerous) {
+			return fmt.Errorf("potentially dangerous regex pattern detected")
+		}
+	}
+
+	// Count nested quantifiers and alternations
+	quantifierCount := strings.Count(pattern, "+") + strings.Count(pattern, "*") + strings.Count(pattern, "?")
+	if quantifierCount > 10 {
+		return fmt.Errorf("too many quantifiers in regex pattern (max 10)")
+	}
+
+	alternationCount := strings.Count(pattern, "|")
+	if alternationCount > 20 {
+		return fmt.Errorf("too many alternations in regex pattern (max 20)")
+	}
+
+	return nil
+}
+
+// safeRegexReplaceAll executes ReplaceAllString with timeout protection
+func (fs *FilesystemHandler) safeRegexReplaceAll(re *regexp.Regexp, content, replacement string) (string, int, error) {
+	type result struct {
+		content string
+		count   int
+		err     error
+	}
+
+	ch := make(chan result, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), REGEX_TIMEOUT_SECONDS*time.Second)
+	defer cancel()
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ch <- result{"", 0, fmt.Errorf("regex operation panic: %v", r)}
+			}
+		}()
+
+		replaced := re.ReplaceAllString(content, replacement)
+		count := len(re.FindAllString(content, -1))
+		ch <- result{replaced, count, nil}
+	}()
+
+	select {
+	case res := <-ch:
+		return res.content, res.count, res.err
+	case <-ctx.Done():
+		return "", 0, fmt.Errorf("regex operation timed out after %d seconds", REGEX_TIMEOUT_SECONDS)
+	}
+}
+
+// safeRegexReplaceFirst executes first match replacement with timeout protection
+func (fs *FilesystemHandler) safeRegexReplaceFirst(re *regexp.Regexp, content, replacement string) (string, int, error) {
+	type result struct {
+		content string
+		count   int
+		err     error
+	}
+
+	ch := make(chan result, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), REGEX_TIMEOUT_SECONDS*time.Second)
+	defer cancel()
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ch <- result{"", 0, fmt.Errorf("regex operation panic: %v", r)}
+			}
+		}()
+
+		matched := re.FindStringIndex(content)
+		if matched != nil {
+			replaced := content[:matched[0]] + replacement + content[matched[1]:]
+			ch <- result{replaced, 1, nil}
+		} else {
+			ch <- result{content, 0, nil}
+		}
+	}()
+
+	select {
+	case res := <-ch:
+		return res.content, res.count, res.err
+	case <-ctx.Done():
+		return "", 0, fmt.Errorf("regex operation timed out after %d seconds", REGEX_TIMEOUT_SECONDS)
+	}
 }

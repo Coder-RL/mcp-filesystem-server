@@ -11,6 +11,14 @@ const (
 	MAX_SEARCH_RESULTS = 1000
 	// Maximum file size in bytes to search within (10MB)
 	MAX_SEARCHABLE_SIZE = 10 * 1024 * 1024
+	// Security: Maximum regex pattern length to prevent ReDoS
+	MAX_REGEX_LENGTH = 1000
+	// Security: Maximum tree traversal depth
+	MAX_TREE_DEPTH = 50
+	// Security: Maximum nodes in a tree to prevent memory exhaustion
+	MAX_TREE_NODES = 10000
+	// Security: Regex execution timeout in seconds
+	REGEX_TIMEOUT_SECONDS = 5
 )
 
 type FileInfo struct {

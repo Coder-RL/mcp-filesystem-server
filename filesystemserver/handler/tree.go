@@ -40,7 +40,31 @@ func (fs *FilesystemHandler) HandleTree(
 	// Extract depth parameter (optional, default: 3)
 	depth := 3 // Default value
 	if depthParam, err := request.RequireFloat("depth"); err == nil {
-		depth = int(depthParam)
+		requestedDepth := int(depthParam)
+		// Security: Enforce maximum depth to prevent DoS attacks
+		if requestedDepth > MAX_TREE_DEPTH {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					mcp.TextContent{
+						Type: "text",
+						Text: fmt.Sprintf("Error: Maximum depth exceeded (max %d)", MAX_TREE_DEPTH),
+					},
+				},
+				IsError: true,
+			}, nil
+		}
+		if requestedDepth < 0 {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					mcp.TextContent{
+						Type: "text",
+						Text: "Error: Depth cannot be negative",
+					},
+				},
+				IsError: true,
+			}, nil
+		}
+		depth = requestedDepth
 	}
 
 	// Extract follow_symlinks parameter (optional, default: false)
@@ -89,8 +113,10 @@ func (fs *FilesystemHandler) HandleTree(
 		}, nil
 	}
 
-	// Build the tree structure
-	tree, err := fs.buildTree(validPath, depth, 0, followSymlinks)
+	// Build the tree structure with cycle detection
+	visitedPaths := make(map[string]bool)
+	nodeCount := 0
+	tree, err := fs.buildTreeSafe(validPath, depth, 0, followSymlinks, visitedPaths, &nodeCount)
 	if err != nil {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
@@ -139,8 +165,23 @@ func (fs *FilesystemHandler) HandleTree(
 	}, nil
 }
 
-// buildTree builds a tree representation of the filesystem starting at the given path
-func (fs *FilesystemHandler) buildTree(path string, maxDepth int, currentDepth int, followSymlinks bool) (*FileNode, error) {
+// buildTreeSafe builds a tree representation with security protections
+func (fs *FilesystemHandler) buildTreeSafe(path string, maxDepth int, currentDepth int, followSymlinks bool, visitedPaths map[string]bool, nodeCount *int) (*FileNode, error) {
+	// Security: Prevent excessive memory usage
+	*nodeCount++
+	if *nodeCount > MAX_TREE_NODES {
+		return nil, fmt.Errorf("maximum number of nodes exceeded (max %d)", MAX_TREE_NODES)
+	}
+
+	// Security: Detect symlink cycles
+	if visitedPaths[path] {
+		return nil, fmt.Errorf("symlink cycle detected at path: %s", path)
+	}
+	visitedPaths[path] = true
+	defer func() {
+		// Remove from visited paths when leaving this branch (for proper tree traversal)
+		delete(visitedPaths, path)
+	}()
 	// Validate the path
 	validPath, err := fs.validatePath(path)
 	if err != nil {
@@ -199,8 +240,8 @@ func (fs *FilesystemHandler) buildTree(path string, maxDepth int, currentDepth i
 					entryPath = linkDest
 				}
 
-				// Recursively build child node
-				childNode, err := fs.buildTree(entryPath, maxDepth, currentDepth+1, followSymlinks)
+				// Recursively build child node with security protections
+				childNode, err := fs.buildTreeSafe(entryPath, maxDepth, currentDepth+1, followSymlinks, visitedPaths, nodeCount)
 				if err != nil {
 					// Skip entries with errors
 					continue

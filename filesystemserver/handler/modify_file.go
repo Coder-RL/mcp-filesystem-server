@@ -120,6 +120,19 @@ func (fs *FilesystemHandler) HandleModifyFile(
 
 	// Perform the replacement
 	if useRegex {
+		// Security: Validate regex pattern to prevent ReDoS attacks
+		if err := fs.validateRegexSecurity(find); err != nil {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					mcp.TextContent{
+						Type: "text",
+						Text: fmt.Sprintf("Error: %v", err),
+					},
+				},
+				IsError: true,
+			}, nil
+		}
+
 		re, err := regexp.Compile(find)
 		if err != nil {
 			return &mcp.CallToolResult{
@@ -133,17 +146,32 @@ func (fs *FilesystemHandler) HandleModifyFile(
 			}, nil
 		}
 
+		// Security: Execute regex operations with timeout protection
 		if allOccurrences {
-			modifiedContent = re.ReplaceAllString(originalContent, replace)
-			replacementCount = len(re.FindAllString(originalContent, -1))
+			modifiedContent, replacementCount, err = fs.safeRegexReplaceAll(re, originalContent, replace)
+			if err != nil {
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{
+						mcp.TextContent{
+							Type: "text",
+							Text: fmt.Sprintf("Error: Regex operation timed out or failed: %v", err),
+						},
+					},
+					IsError: true,
+				}, nil
+			}
 		} else {
-			matched := re.FindStringIndex(originalContent)
-			if matched != nil {
-				replacementCount = 1
-				modifiedContent = originalContent[:matched[0]] + replace + originalContent[matched[1]:]
-			} else {
-				modifiedContent = originalContent
-				replacementCount = 0
+			modifiedContent, replacementCount, err = fs.safeRegexReplaceFirst(re, originalContent, replace)
+			if err != nil {
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{
+						mcp.TextContent{
+							Type: "text",
+							Text: fmt.Sprintf("Error: Regex operation timed out or failed: %v", err),
+						},
+					},
+					IsError: true,
+				}, nil
 			}
 		}
 	} else {
